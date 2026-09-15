@@ -4,9 +4,9 @@
 
 *The doctor's orders: no type instability allowed!*
 
-[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://astroautomata.com/DispatchDoctor.jl/dev/)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://ai.damtp.cam.ac.uk/dispatchdoctor/dev/)
 [![Build Status](https://github.com/MilesCranmer/DispatchDoctor.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/MilesCranmer/DispatchDoctor.jl/actions/workflows/CI.yml?query=branch%3Amain)
-[![Coverage](https://coveralls.io/repos/github/MilesCranmer/DispatchDoctor.jl/badge.svg?branch=main)](https://coveralls.io/github/MilesCranmer/DispatchDoctor.jl?branch=main)
+[![codecov](https://codecov.io/gh/MilesCranmer/DispatchDoctor.jl/branch/main/graph/badge.svg?token=tCOvkJPPDY)](https://codecov.io/gh/MilesCranmer/DispatchDoctor.jl)
 
 [![DispatchDoctor](https://img.shields.io/badge/%F0%9F%A9%BA_tested_with-DispatchDoctor.jl-blue?labelColor=white)](https://github.com/MilesCranmer/DispatchDoctor.jl)
 
@@ -57,6 +57,7 @@ top:
 ```
 
 Meaning there is zero overhead on this type stability check.
+(This may not always be true, so be sure to try the workflow in [usage in packages](#-usage-in-packages))
 
 You can use `@stable` on blocks of code,
 including `begin-end` blocks, `module`, and anonymous functions.
@@ -125,13 +126,13 @@ You can provide the following options to `@stable`:
 
 - `default_mode::String="error"`:
   - Change the default mode from `"error"` to `"warn"` to only emit a warning, or `"disable"` to disable type instability checks by default.
-  - To locally or globally override the mode for a package that uses DispatchDoctor, you can use the `"instability_check"` key in your LocalPreferences.toml (typically configured with Preferences.jl).
+  - To locally or globally override the mode for a package that uses DispatchDoctor, you can use the `"dispatch_doctor_mode"` key in your LocalPreferences.toml (typically configured with Preferences.jl).
 - `default_codegen_level::String="debug"`:
   - Set the code generation level to `"min"` to only generate a single function body for each stabilized function. The default, `"debug"`, generates an entire duplicate function so that `@code_warntype` can be used.
-  - To locally or globally override the code generation level for a package that uses DispatchDoctor, you can use the `"instability_check_codegen_level"` key in your LocalPreferences.toml.
+  - To locally or globally override the code generation level for a package that uses DispatchDoctor, you can use the `"dispatch_doctor_codegen_level"` key in your LocalPreferences.toml.
 - `default_union_limit::Int=1`:
   - Sets the maximum elements in a union to be considered stable. The default is `1`, meaning that all unions are considered unstable. A value of `2` would indicate that `Union{Float32,Float64}` is considered stable, but `Union{Float16,Float32,Float64}` is not.
-  - To locally or globally override the union limit for a package that uses DispatchDoctor, you can use the `"instability_check_union_limit"` key in your LocalPreferences.toml.
+  - To locally or globally override the union limit for a package that uses DispatchDoctor, you can use the `"dispatch_doctor_union_limit"` key in your LocalPreferences.toml.
 
 Each of these is denoted a `default_` because you may set them globally or at a per-package level with `Preferences.jl` (see below).
 
@@ -157,6 +158,18 @@ end
 `"disable"` as the mode will turn `@stable` into a *no-op*, so that
 DispatchDoctor has no effect on your code by default.
 
+If you prefer annotating individual functions but want to avoid repeating keywords (e.g., always using `default_mode="disable"`), you can define a small wrapper macro inside your package:
+
+```julia
+import DispatchDoctor
+
+macro stable(ex)
+    return esc(:($(DispatchDoctor).@stable default_mode = "disable" $ex))
+end
+```
+
+Then you can use `@stable` throughout your code, while still being able to refer to the original macro explicitly as `DispatchDoctor.@stable`.
+
 The mode is configurable
 via [Preferences.jl](https://github.com/JuliaPackaging/Preferences.jl),
 meaning that, within your `test/runtests.jl`, you could add a line **before importing your package**:
@@ -164,7 +177,7 @@ meaning that, within your `test/runtests.jl`, you could add a line **before impo
 ```julia
 using Preferences: set_preferences!
 
-set_preferences!("MyPackage", "instability_check" => "error")
+set_preferences!("MyPackage", "dispatch_doctor_mode" => "error")
 ```
 
 You can also set to be `"warn"` if you would just like warnings.
@@ -175,10 +188,10 @@ the default `"debug"`. This will result in no code duplication,
 improving precompilation time (although `@code_warntype` and error
 messages will be less useful).
 As with the `default_mode`, you can configure the codegen level with Preferences.jl
-by using the `"instability_check_codegen_level"` key.
+by using the `"dispatch_doctor_codegen_level"` key.
 
 Note that for code coverage to work as expected over stabilized code,
-you will also need to use `default_codegen_level="min"`.
+you will also need to use `dispatch_doctor_codegen_level="min"`.
 
 ## 🔬 Special Cases
 
@@ -186,17 +199,17 @@ you will also need to use `default_codegen_level="min"`.
 > There are several scenarios and special cases for which type instabilities will be ignored. These are discussed below.
 
 1. **During precompilation.**
-2. **In unsupported Julia versions**.
+2. **In unsupported Julia versions** (currently only [1.10.0, 1.13.0) are active)
 3. **When loading code changes with Revise.jl\*.**
    - \*Basically, `@stable` will attempt to travel through any `include`'s. However, if you edit the included file and load the changes with Revise.jl, instability checks will get stripped (see [Revise#634](https://github.com/timholy/Revise.jl/issues/634)). The result will be that the `@stable` will be ignored.
 4. **Within certain code blocks and function types:**
     - Within an `@unstable` block
     - Within a `@generated` block
+    - Within any function containing a `@nospecialize` macro
 	- Within a `quote ... end` block
 	- Within a `macro ... end` block
 	- Within an incompatible macro, such as
 		- `@eval`
-		- `@generated`
 		- `@assume_effects`
 		- `@pure`
 		- Or anything else registered as incompatible with `register_macro!`
@@ -220,7 +233,7 @@ type with a special color for any instabilities.
 
 Note that some of the lines you will see are from DispatchDoctor's inserted
 code. If those are bothersome, you can disable the checking with
-`Preferences.set_preferences!("MyPackage", "instability_check" => "disable")`
+`Preferences.set_preferences!("MyPackage", "dispatch_doctor_mode" => "disable")`
 followed by restarting Julia.
 
 Other, much more powerful options to try include

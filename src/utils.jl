@@ -6,7 +6,7 @@ using MacroTools: @capture
 # Compatible Julia versions
 const JULIA_OK = let
     JULIA_LOWER_BOUND = v"1.10.0-DEV.0"
-    JULIA_UPPER_BOUND = v"1.12.0-DEV.0"
+    JULIA_UPPER_BOUND = v"1.14.0-DEV.0"
     # TODO: Get exact lower/upper bounds
 
     VERSION >= JULIA_LOWER_BOUND && VERSION < JULIA_UPPER_BOUND
@@ -56,7 +56,12 @@ arg expression and, if needed, an equivalent destructuring assignment for the bo
 function sanitize_arg_for_stability_check(
     ex::Symbol
 )::Tuple{Union{Expr,Symbol},Union{Expr,Nothing}}
-    return ex, nothing
+    if ex == :(_)
+        arg = gensym("arg")
+        return arg, Expr(:(=), ex, arg)
+    else
+        return ex, nothing
+    end
 end
 function sanitize_arg_for_stability_check(
     ex::Expr
@@ -103,17 +108,12 @@ end
 # typeof but returns Type{T} for a type T input
 specializing_typeof(::T) where {T} = T
 specializing_typeof(::Type{T}) where {T} = Type{T}
+specializing_typeof(arg::Type{<:Type}) = typeof(arg)
 specializing_typeof(::Val{T}) where {T} = Val{T}
 map_specializing_typeof(args::Tuple) = map(specializing_typeof, args)
 
-function _promote_op(f, S::Vararg{Type})
-    if @generated
-        # TODO: Remove once if this compilation issue is fixed within Julia:
-        # https://github.com/MilesCranmer/DispatchDoctor.jl/issues/51
-        :(Base.promote_op(f, S...))
-    else
-        Base.promote_op(f, S...)
-    end
+function _promote_op(f::F, S::Vararg{Type,N}) where {F,N}
+    return Base.promote_op(f, S...)
 end
 @static if isdefined(Core, :kwcall)
     function _promote_op(
@@ -130,25 +130,45 @@ Returns true if this type is not concrete. Will also
 return false for `Union{}`, so that errors can propagate.
 """
 @inline type_instability(::Type{T}) where {T} = !Base.isconcretetype(T)
-@inline type_instability(::Type{Union{}}) = false
+@inline type_instability(::Type{Union{}}) = false  # LCOV_EXCL_LINE
+
+@static if Base.isdefined(Core, :TypeofBottom)
+    @inline type_instability(::Type{Core.TypeofBottom}) = false  # LCOV_EXCL_LINE
+end
 
 # Weirdly, Base.isconcretetype flags Type{T} itself as not concrete,
 # so we implement a workaround.
 @inline type_instability(::Type{Type{T}}) where {T} = type_instability(T)
 
-@generated function type_instability_limit_unions(
+@inline function type_instability_limit_unions(
+    T::Core.TypeofVararg, ::Val{union_limit}
+) where {union_limit}
+    # Treat it as unstable unless BOTH parameters are concrete *and* the
+    # element type itself is stable.
+    return !isdefined(T, :T) ||
+           !isdefined(T, :N) ||
+           type_instability_limit_unions(T.T, Val(union_limit))
+end
+
+@inline function type_instability_limit_unions(
     ::Type{T}, ::Val{union_limit}
 ) where {T,union_limit}
     if T isa UnionAll
         return true
-    elseif T <: Tuple && !(T isa Union)
+    elseif T <: Tuple && !(T isa Union) && hasproperty(T, :types)
         return any(Base.Fix2(type_instability_limit_unions, Val(union_limit)), T.types)
     else
         return _type_instability_recurse_unions(T) || _count_unions(T) > union_limit
     end
 end
 
-_count_unions(::Type{T}) where {T} = T isa Union ? (1 + _count_unions(T.b)) : 1
+function _count_unions(::Type{T}) where {T}
+    if T isa Union
+        return 1 + _count_unions(T.b)
+    else
+        return 1
+    end
+end
 
 function _type_instability_recurse_unions(::Type{T}) where {T}
     if T isa Union
@@ -157,5 +177,16 @@ function _type_instability_recurse_unions(::Type{T}) where {T}
         type_instability(T)
     end
 end
+
+"""
+Recursively search an expression for @nospecialize macro
+"""
+function has_nospecialize(ex::Expr)
+    if ex.head == :macrocall && ex.args[1] == Symbol("@nospecialize")
+        return true
+    end
+    return any(has_nospecialize, ex.args)
+end
+has_nospecialize(::Any) = false  # LCOV_EXCL_LINE
 
 end

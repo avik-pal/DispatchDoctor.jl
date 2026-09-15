@@ -90,9 +90,11 @@ end
 
         eval(f_expanded)
 
-        @test f([1]) == 1
-        @test_throws MethodError f((1,)) == 1
-        DispatchDoctor.JULIA_OK && @test_throws TypeInstabilityError f(Any[1])
+        call_f(args...) = Base.invokelatest(f, args...)
+
+        @test call_f([1]) == 1
+        @test_throws MethodError call_f((1,)) == 1
+        DispatchDoctor.JULIA_OK && @test_throws TypeInstabilityError call_f(Any[1])
     end
 end
 @testitem "multiple tuple args" begin
@@ -163,10 +165,13 @@ end
             end
 
             eval(fex)
-            @test f(StableType(1, 2.0)) == 1
-            @test_throws MethodError f((; x=1))
+
+            call_f(args...) = Base.invokelatest(f, args...)
+
+            @test call_f(StableType(1, 2.0)) == 1
+            @test_throws MethodError call_f((; x=1))
             DispatchDoctor.JULIA_OK &&
-                @test_throws TypeInstabilityError f(UnstableType(1, 2.0))
+                @test_throws TypeInstabilityError call_f(UnstableType(1, 2.0))
         end
     end
 end
@@ -223,6 +228,32 @@ end
             end
         end
     end
+end
+@testitem "detect duplicate LineNumberNode in @stable expansion" begin
+    using DispatchDoctor
+
+    # Basically we want to verify that the simulator function
+    # doesn't duplicate any LineNumberNodes, which can
+    # mess with stacktraces and coverage.
+    ex = @macroexpand(@stable(function f(x)
+        return x
+    end))
+
+    function collect_line_nodes!(line_nodes, expr)
+        if expr isa LineNumberNode
+            push!(line_nodes, expr)
+        elseif expr isa Expr
+            for arg in expr.args
+                collect_line_nodes!(line_nodes, arg)
+            end
+        end
+        return line_nodes
+    end
+
+    line_nodes = collect_line_nodes!([], ex)
+
+    @test length(line_nodes) > 1
+    @test length(unique(line_nodes)) == length(line_nodes)  # No dupes!
 end
 @testitem "Type specialization" begin
     using DispatchDoctor
@@ -523,8 +554,8 @@ end
     #! format: on
 
     # We should be able to find a g_simulator, but NOT
-    # an f_simulator (indicating the `@stable` has not
-    # been expanded yet)
+    # an f_simulator (indicating the `@stable` has
+    # not been expanded yet)
     @test length(f_defs) == 3
 
     @test any(e -> occursin("g_simulator", string(e)), f_defs)
@@ -578,7 +609,7 @@ end
     @stable f(_) = rand(Bool) ? Float32 : Float64
     DispatchDoctor.JULIA_OK && @test_throws TypeInstabilityError f(1)
     if VERSION >= v"1.9"
-        @test_throws "with arguments `([_],)`" f(1)
+        @test_throws "with arguments `(Int64,)`" f(1)
     end
 end
 @testitem "skip closures inside macros" begin
@@ -840,7 +871,7 @@ end
     macro mymacro(ex)
         return esc(ex)
     end
-    if !haskey(DispatchDoctor.MACRO_BEHAVIOR.table, Symbol("@mymacro"))
+    if !haskey(DispatchDoctor.MACRO_BEHAVIOR.table, (Symbol("@mymacro"), nothing))
         register_macro!(Symbol("@mymacro"), DispatchDoctor.IncompatibleMacro)
     end
     @test DispatchDoctor.get_macro_behavior(:(@mymacro x = 1)) ==
@@ -860,6 +891,86 @@ end
         @test f(0) == 0
     end
 end
+@testitem "register macros scoped to root module" begin
+    using DispatchDoctor
+    using DispatchDoctor: _Interactions as DDI
+
+    push!(LOAD_PATH, joinpath(@__DIR__, "FakePackage1"))
+    push!(LOAD_PATH, joinpath(@__DIR__, "FakePackage2"))
+
+    using FakePackage1
+    using FakePackage2
+
+    macro_ident = Symbol("dd_scoped_macro_", rand(UInt))
+    macro_sym = Symbol("@", macro_ident)
+    submod_ident = Symbol("Sub_", macro_ident)
+
+    FakePackage1.eval(:(module $(submod_ident) end))
+    submod = getfield(FakePackage1, submod_ident)
+    submod.eval(:(macro $(macro_ident)(ex) return esc(ex) end))
+
+    FakePackage2.eval(:(macro $(macro_ident)(ex) return esc(ex) end))
+
+    # Register a global fallback behavior, then override it for FakePackage1's root.
+    register_macro!(macro_sym, DDI.DontPropagateMacro, nothing)
+    register_macro!(macro_sym, DDI.IncompatibleMacro, submod) # Normalizes to Base.moduleroot(FakePackage1)
+
+    @test haskey(DDI.MACRO_BEHAVIOR.table, (macro_sym, FakePackage1))
+    @test !haskey(DDI.MACRO_BEHAVIOR.table, (macro_sym, submod))
+
+    @test DDI.get_macro_behavior(macro_sym, FakePackage1) == DDI.IncompatibleMacro
+    @test DDI.get_macro_behavior(macro_sym, submod) == DDI.IncompatibleMacro
+    @test DDI.get_macro_behavior(macro_sym, FakePackage2) == DDI.DontPropagateMacro
+
+    # Integration test: `@stable` should consult the calling root module.
+    f_name = Symbol("f_", macro_ident)
+    g_name = Symbol("g_", macro_ident)
+    unstable_f_def = :(function $(f_name)(x)
+        return rand(Bool) ? x : 0.0
+    end)
+    unstable_g_def = :(function $(g_name)(x)
+        return rand(Bool) ? x : 0.0
+    end)
+
+    # FakePackage1: incompatible -> skipped -> no instability error
+    inner_f = Expr(:macrocall, macro_sym, LineNumberNode(1, :none), unstable_f_def)
+    submod.eval(:($(DispatchDoctor).@stable $(inner_f)))
+    @test submod.eval(Expr(:call, f_name, 1)) in (1, 0.0)
+
+    # FakePackage2: global dont-propagate -> stabilized -> instability error
+    inner_g = Expr(:macrocall, macro_sym, LineNumberNode(1, :none), unstable_g_def)
+    FakePackage2.eval(:($(DispatchDoctor).@stable $(inner_g)))
+    if DispatchDoctor.JULIA_OK
+        @test_throws DispatchDoctor.TypeInstabilityError FakePackage2.eval(
+            Expr(:call, g_name, 1)
+        )
+    else
+        @test FakePackage2.eval(Expr(:call, g_name, 1)) in (1, 0.0)
+    end
+
+    # Duplicate registration for the same (macro, scope) should throw.
+    tmp_ident = Symbol("dd_scoped_duplicate_", rand(UInt))
+    tmp_sym = Symbol("@", tmp_ident)
+    register_macro!(tmp_sym, DDI.CompatibleMacro, nothing)
+    @test_throws "already registered" register_macro!(tmp_sym, DDI.IncompatibleMacro, nothing)
+end
+@testitem "GlobalRef macro behavior uses calling module" begin
+    using DispatchDoctor
+    using DispatchDoctor: _Interactions as DDI
+
+    # `_stabilize_all` calls the two-argument form; a `GlobalRef` must not
+    # hit the generic `CompatibleMacro` fallback.
+    @test DDI.get_macro_behavior(GlobalRef(Base.Docs, Symbol("@doc")), Main) ==
+        DDI.DontPropagateMacro
+
+    # The calling module must be forwarded for scoped registrations.
+    macro_ident = Symbol("dd_globalref_macro_", rand(UInt))
+    macro_sym = Symbol("@", macro_ident)
+    register_macro!(macro_sym, DDI.IncompatibleMacro, Base)
+    ref = GlobalRef(Base, macro_sym)
+    @test DDI.get_macro_behavior(ref, Base) == DDI.IncompatibleMacro
+    @test DDI.get_macro_behavior(ref, Main) == DDI.CompatibleMacro
+end
 @testitem "merging behavior of registered macros" begin
     using DispatchDoctor
     using DispatchDoctor: _Interactions as DDI
@@ -873,13 +984,13 @@ end
     macro dontpropagatemacro(ex)
         return esc(ex)
     end
-    if !haskey(DDI.MACRO_BEHAVIOR.table, Symbol("@compatiblemacro"))
+    if !haskey(DDI.MACRO_BEHAVIOR.table, (Symbol("@compatiblemacro"), nothing))
         register_macro!(Symbol("@compatiblemacro"), DDI.CompatibleMacro)
     end
-    if !haskey(DDI.MACRO_BEHAVIOR.table, Symbol("@incompatiblemacro"))
+    if !haskey(DDI.MACRO_BEHAVIOR.table, (Symbol("@incompatiblemacro"), nothing))
         register_macro!(Symbol("@incompatiblemacro"), DDI.IncompatibleMacro)
     end
-    if !haskey(DDI.MACRO_BEHAVIOR.table, Symbol("@dontpropagatemacro"))
+    if !haskey(DDI.MACRO_BEHAVIOR.table, (Symbol("@dontpropagatemacro"), nothing))
         register_macro!(Symbol("@dontpropagatemacro"), DDI.DontPropagateMacro)
     end
     @test DDI.get_macro_behavior(:(@compatiblemacro true x = 1)) == DDI.CompatibleMacro
@@ -1189,6 +1300,26 @@ end
 
     @test f(2) == (nothing, 1)
 end
+@testitem "issue with underscore function and min codegen" begin
+    #! format: off
+    using DispatchDoctor
+
+    @stable g_debug(_::Int) = 1
+    @test g_debug(1) == 1
+    @stable default_codegen_level = "min" g_min(_::Int) = 1
+    @test g_min(1) == 1
+
+    @stable f_debug(_::Int, _::Float64) = 1
+    @test f_debug(1, 2.0) == 1
+    @stable default_codegen_level = "min" f_min(_::Int, _::Float64) = 1
+    @test f_min(1, 2.0) == 1
+
+    @stable default_codegen_level = "min" f_min_with_error(_::Int, _::Float64) = Val(rand())
+    if DispatchDoctor.JULIA_OK
+        @test_throws TypeInstabilityError f_min_with_error(1, 2.0)
+    end
+    # ! format: on
+end
 @testitem "deprecated options" begin
     using DispatchDoctor
     using Suppressor: @capture_err
@@ -1221,6 +1352,11 @@ end
 
     @test DDU.is_function_name_compatible(1.0) == false
     @test DDU.is_symbol_like(1.0) == false
+
+    if Base.isdefined(Core, :TypeofBottom)
+        @test DD.type_instability(Core.TypeofBottom) == false
+        @test DD.type_instability_limit_unions(Core.TypeofBottom, Val(1)) == false
+    end
 end
 @testitem "Code quality (Aqua.jl)" begin
     using DispatchDoctor
@@ -1233,7 +1369,7 @@ end
     using JET
 
     if VERSION >= v"1.10"
-        JET.test_package(DispatchDoctor; target_defined_modules=true)
+        JET.test_package(DispatchDoctor; target_modules=(DispatchDoctor,))
     end
 end
 @testitem "llvm ir" begin
@@ -1244,6 +1380,112 @@ end
     # Important to run the LLVM IR tests in a new
     # julia process with things like --code-coverage disabled.
     # See https://discourse.julialang.org/t/improving-speed-of-runtime-dispatch-detector/114697/14?u=milescranmer
+end
+@testitem "nospecialize tests" begin
+    using DispatchDoctor
+
+    @stable begin
+        # Will ignore everything that has a @nospecialize macro:
+        function test_nospecialize(@nospecialize(x))
+            return x > 0 ? x : 0.0
+        end
+        function test_nospecialize_with_type(@nospecialize(x::Integer))
+            return x > 0 ? x : 0.0
+        end
+        function test_nospecialize_with_default(@nospecialize(x)=1)
+            return x > 0 ? x : 0.0
+        end
+        # Including keywords:
+        function test_nospecialize_kwarg(x; @nospecialize(y))
+            return x > 0 ? y : 0.0
+        end
+        function test_nospecialize_kwarg_typed(x; @nospecialize(y::Integer))
+            return x > 0 ? y : 0.0
+        end
+        function test_nospecialize_kwarg_default(x; @nospecialize(y = 1))
+            return x > 0 ? y : 0.0
+        end
+        # This will not stop other functions from being stabilized:
+        f() = Val(rand())
+    end
+    @test test_nospecialize(1) == 1
+    @test test_nospecialize_with_type(1) == 1
+    @test test_nospecialize_with_default() == 1
+    @test test_nospecialize_kwarg(1; y=2) == 2
+    @test test_nospecialize_kwarg_typed(1; y=2) == 2
+    @test test_nospecialize_kwarg_default(1) == 1
+    @test_throws TypeInstabilityError f()
+end
+@testitem "issue with Vararg union limit" begin
+    using DispatchDoctor
+    using DispatchDoctor: @stable
+
+    @stable default_union_limit = 2 function tuple_from_vector(v::Vector{Int})
+        # Converting a vector with unknown length to a tuple yields
+        # `Tuple{Vararg{Int64}}`, which internally stores `Core.TypeofVararg`.
+        # This hits the missing method in `type_instability_limit_unions`.
+        return Tuple(v)
+    end
+
+    DispatchDoctor.JULIA_OK &&
+        @test_throws TypeInstabilityError tuple_from_vector([1, 2, 3])
+
+    @stable function tuple_from_vector2(v::Vector{Int})
+        return Tuple(v)
+    end
+    DispatchDoctor.JULIA_OK &&
+        @test_throws TypeInstabilityError tuple_from_vector2([1, 2, 3])
+end
+@testitem "issue with specializing_typeof on unbound type parameters" begin
+    using DispatchDoctor
+
+    @stable function test_function(arg::Type{<:Type})
+        return nothing
+    end
+
+    # This should trigger the error
+    P = (Type{T} where {T}).body
+    @test test_function(P) === nothing
+end
+@testitem "issue with closures causing instability" begin
+    using DispatchDoctor
+
+    @stable function f(x)
+        @stable g() = x
+        return g
+    end
+
+    @test_nowarn f(1.0)()
+    @test f(1.0)() == 1.0
+end
+@testitem "issue with nested allow_unstable" begin
+    using DispatchDoctor
+
+    @stable f() = Val(rand())
+
+    # Issue was that the `allow_unstable` would set the
+    # `INSTABILITY_CHECK_ENABLED` to `false` and then the
+    # `f` would throw an error, _even though_ we are still
+    # within another `allow_unstable` block.
+    @test_nowarn allow_unstable(() -> (allow_unstable(f); f()))
+    @test_throws TypeInstabilityError f()
+end
+
+@testitem "macro behavior with `GlobalRef`" begin
+    using DispatchDoctor
+
+    has_docstring(f) = !isnothing(match(r"\(Base.Docs.doc!\).+\(Base.Docs.Binding\)", string(f)))
+
+    for codegen_level in ("debug", "min")
+        f_expanded = @eval @macroexpand @stable default_codegen_level = $codegen_level begin
+            ""
+            f() = nothing
+        end
+        f_simulator, f_real = f_expanded.args[2].args
+
+        @test !has_docstring(f_simulator)
+        @test has_docstring(f_real)
+    end
 end
 
 @run_package_tests
